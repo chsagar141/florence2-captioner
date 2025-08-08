@@ -1,9 +1,12 @@
 import os
-from PIL import Image
+import io
+import zipfile
+from PIL import Image, UnidentifiedImageError
 from transformers import AutoProcessor, AutoModelForCausalLM
 import torch
 import gradio as gr
 from tqdm import tqdm
+import shutil
 
 # ========== CONFIG ========== #
 MAX_SIZE = 896
@@ -19,11 +22,12 @@ else:
     dtype = torch.float16
     print("✅ GPU detected. Using CUDA for processing.")
 
+# ========== STEP 1: LOAD MODEL ========== #
 
-# ========== STEP 1: LOAD MODEL (Done only once at startup) ========== #
+
 def load_model():
     """Loads the Florence-2 model and processor."""
-    print("📦 Loading Florence-2-large model... (This may take a moment on first run)")
+    print("📦 Loading Florence-2-large model...")
     model_id = "microsoft/Florence-2-large"
 
     try:
@@ -36,20 +40,19 @@ def load_model():
         ).to(device)
     except Exception as e:
         print(f"❌ Failed to load model: {e}")
-        print("Please ensure you have an internet connection to download the model.")
         exit(1)
 
-    print("✅ Model loaded successfully.\n")
+    print("✅ Model loaded.\n")
     return processor, model
 
 
-# Load the model and processor globally to avoid reloading
 processor, model = load_model()
 
+# ========== STEP 2: HELPER FUNCTIONS ========== #
 
-# ========== STEP 2: DEFINE THE CORE FUNCTIONS ========== #
+
 def resize_image_keep_aspect(image, max_size):
-    """Resizes a PIL image while maintaining aspect ratio."""
+    """Resize PIL image while preserving aspect ratio."""
     w, h = image.size
     if max(w, h) <= max_size:
         return image
@@ -57,121 +60,141 @@ def resize_image_keep_aspect(image, max_size):
     return image.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
 
 
-def generate_captions_for_gallery(image_list, progress=gr.Progress(track_tqdm=True)):
-    """
-    Takes a LIST of image data, generates captions, and returns the results
-    for BOTH the output gallery and the hidden state variable.
-    """
+def generate_captions_for_gallery(image_list, user_prompt, progress=gr.Progress(track_tqdm=True)):
     if not image_list:
-        return [], []  # Return empty for both outputs
+        return [], []
 
+    prompt = user_prompt.strip() or "<MORE_DETAILED_CAPTION>"
     results = []
-    print(f"🔄 Received {len(image_list)} images. Starting batch captioning...")
+    print(f"🔄 Received {len(image_list)} images for captioning...")
 
     for image_data in progress.tqdm(image_list, desc="🖼️ Generating Captions"):
-        image_pil = image_data[0]  # Unpack the tuple to get the PIL image
+        try:
+            # Handle image types robustly
+            image_pil = image_data[0] if isinstance(
+                image_data, tuple) else image_data
+            image_rgb = image_pil.convert("RGB")
+            image_resized = resize_image_keep_aspect(image_rgb, MAX_SIZE)
 
-        # --- Core Captioning Logic ---
-        prompt = "<MORE_DETAILED_CAPTION>"
-        image_rgb = image_pil.convert("RGB")
-        image_resized = resize_image_keep_aspect(image_rgb, MAX_SIZE)
+            inputs = processor(images=image_resized,
+                               text=prompt, return_tensors="pt")
+            inputs = {k: v.to(device, dtype=dtype if v.dtype ==
+                              torch.float else None) for k, v in inputs.items()}
 
-        inputs = processor(images=image_resized,
-                           text=prompt, return_tensors="pt")
-        inputs = {k: v.to(device, dtype=dtype if v.dtype ==
-                          torch.float else None) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
+                    max_new_tokens=1024,
+                    num_beams=3,
+                    do_sample=False
+                )
 
-        outputs = model.generate(
-            input_ids=inputs["input_ids"], pixel_values=inputs["pixel_values"],
-            max_new_tokens=1024, num_beams=3, do_sample=False
-        )
+            decoded = processor.batch_decode(
+                outputs, skip_special_tokens=False)[0]
+            result = processor.post_process_generation(
+                decoded, task=prompt, image_size=image_resized.size)
+            caption = result.get(prompt, "Error: Could not generate caption.").replace(
+                "<|endoftext|>", "").strip()
 
-        decoded = processor.batch_decode(outputs, skip_special_tokens=False)[0]
-        result = processor.post_process_generation(
-            decoded, task=prompt, image_size=image_resized.size)
-        caption = result.get("<MORE_DETAILED_CAPTION>",
-                             "Error: Could not generate caption.").strip()
+            results.append((image_pil, caption))
 
-        results.append((image_pil, caption))
+        except Exception as e:
+            print(f"❌ Error processing image: {e}")
+            results.append((image_pil, "❌ Failed to generate caption."))
 
-    print(f"\n✅ Batch captioning complete for {len(results)} images.")
-    # Return results for the gallery and also for the state
+    print(f"\n✅ Completed captioning {len(results)} images.")
     return results, results
 
 
 def save_results(results_to_save):
-    """
-    Saves the images and captions from the state variable to the 'Final' folder.
-    """
     if not results_to_save:
-        return "⚠️ No results to save. Please generate captions first."
+        return "⚠️ No results to save."
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-
     num_saved = 0
+
     for i, (image, caption) in enumerate(results_to_save):
         try:
-            # Define file paths with sequential naming
-            img_path = os.path.join(OUTPUT_FOLDER, f"img_{i+1}.png")
-            txt_path = os.path.join(OUTPUT_FOLDER, f"img_{i+1}.txt")
+            img_path = os.path.join(OUTPUT_FOLDER, f"img_{i+1:04d}.png")
+            txt_path = os.path.join(OUTPUT_FOLDER, f"img_{i+1:04d}.txt")
 
             image.save(img_path, "PNG")
-
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(caption)
             num_saved += 1
         except Exception as e:
-            print(f"Error saving file for image {i+1}: {e}")
-            return f"❌ Error saving file for image {i+1}. Check console for details."
+            print(f"❌ Error saving image {i+1}: {e}")
 
-    return f"✅ Successfully saved {num_saved} image-caption pairs to the '{OUTPUT_FOLDER}' folder."
+    return f"✅ Saved {num_saved} image-caption pairs in '{OUTPUT_FOLDER}'"
 
 
-# ========== STEP 3: CREATE AND LAUNCH THE GRADIO GUI ========== #
+def zip_and_return_path():
+    zip_path = OUTPUT_FOLDER + ".zip"
+    try:
+        shutil.make_archive(OUTPUT_FOLDER, 'zip', OUTPUT_FOLDER)
+        return zip_path
+    except Exception as e:
+        print(f"❌ Failed to zip results: {e}")
+        return None
+
+
+# ========== STEP 3: GRADIO UI ========== #
 if __name__ == "__main__":
 
     with gr.Blocks(theme=gr.themes.Soft()) as gui:
-        gr.Markdown("# Batch Image Captioning with Florence-2")
+        gr.Markdown("# Florence-2 Batch Image Captioning")
         gr.Markdown(
-            "Drop one or more images into the input box, click 'Generate', and then 'Save Results' to store them locally."
-        )
+            "Upload images → Enter a prompt (or use default) → Generate captions → Save → Download ZIP")
 
-        # Hidden state component to store the results between button clicks
         results_state = gr.State([])
+
+        prompt_input = gr.Textbox(
+            label="Caption Prompt",
+            value="<MORE_DETAILED_CAPTION>",
+            placeholder="Enter prompt like <MORE_DETAILED_CAPTION>, <CUTE_CAT>, etc.",
+            interactive=True
+        )
 
         with gr.Row():
             input_gallery = gr.Gallery(
-                label="Upload Images", type="pil", elem_id="gallery_input"
+                label="Upload Images (all formats supported)",
+                type="pil",
+                elem_id="gallery_input"
             )
             output_gallery = gr.Gallery(
-                label="Captioned Images", show_label=True, elem_id="gallery_output", allow_preview=True
+                label="Captioned Results",
+                show_label=True,
+                elem_id="gallery_output",
+                allow_preview=True
             )
 
         with gr.Row():
             generate_btn = gr.Button(
                 "🖼️ Generate Captions", variant="primary", scale=2)
-            save_btn = gr.Button(
-                "💾 Save Results", variant="secondary", scale=1)
+            save_btn = gr.Button("💾 Save Results", variant="secondary")
+            zip_btn = gr.Button("📦 Download ZIP", variant="secondary")
 
         status_text = gr.Textbox(label="Status", interactive=False)
+        zip_file = gr.File(label="Download Link", interactive=False)
 
-        # Define button actions
+        # Button Logic
         generate_btn.click(
             fn=generate_captions_for_gallery,
-            inputs=input_gallery,
-            # The output goes to two places: the visible gallery and the hidden state
+            inputs=[input_gallery, prompt_input],
             outputs=[output_gallery, results_state]
         )
 
         save_btn.click(
             fn=save_results,
-            # The input for the save function is the data we stored in the hidden state
             inputs=results_state,
-            # The output is the confirmation message in the status box
             outputs=status_text
         )
 
-    # Launch the GUI
-    print("🚀 Launching Gradio GUI...")
-    print("Open the following URL in your browser to use the app.")
+        zip_btn.click(
+            fn=zip_and_return_path,
+            outputs=zip_file
+        )
+
+    print("🚀 Launching GUI...")
     gui.launch(share=True)
