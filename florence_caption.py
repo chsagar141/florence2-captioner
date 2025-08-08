@@ -1,12 +1,10 @@
 import os
-import io
-import zipfile
-from PIL import Image, UnidentifiedImageError
+import shutil
+from PIL import Image
 from transformers import AutoProcessor, AutoModelForCausalLM
 import torch
 import gradio as gr
 from tqdm import tqdm
-import shutil
 
 # ========== CONFIG ========== #
 MAX_SIZE = 896
@@ -22,14 +20,12 @@ else:
     dtype = torch.float16
     print("✅ GPU detected. Using CUDA for processing.")
 
-# ========== STEP 1: LOAD MODEL ========== #
+# ========== LOAD MODEL ========== #
 
 
 def load_model():
-    """Loads the Florence-2 model and processor."""
     print("📦 Loading Florence-2-large model...")
     model_id = "microsoft/Florence-2-large"
-
     try:
         processor = AutoProcessor.from_pretrained(
             model_id, trust_remote_code=True)
@@ -41,18 +37,16 @@ def load_model():
     except Exception as e:
         print(f"❌ Failed to load model: {e}")
         exit(1)
-
     print("✅ Model loaded.\n")
     return processor, model
 
 
 processor, model = load_model()
 
-# ========== STEP 2: HELPER FUNCTIONS ========== #
+# ========== CORE FUNCTIONS ========== #
 
 
 def resize_image_keep_aspect(image, max_size):
-    """Resize PIL image while preserving aspect ratio."""
     w, h = image.size
     if max(w, h) <= max_size:
         return image
@@ -66,11 +60,10 @@ def generate_captions_for_gallery(image_list, user_prompt, progress=gr.Progress(
 
     prompt = user_prompt.strip() or "<MORE_DETAILED_CAPTION>"
     results = []
-    print(f"🔄 Received {len(image_list)} images for captioning...")
+    print(f"🔄 Processing {len(image_list)} images...")
 
     for image_data in progress.tqdm(image_list, desc="🖼️ Generating Captions"):
         try:
-            # Handle image types robustly
             image_pil = image_data[0] if isinstance(
                 image_data, tuple) else image_data
             image_rgb = image_pil.convert("RGB")
@@ -100,18 +93,19 @@ def generate_captions_for_gallery(image_list, user_prompt, progress=gr.Progress(
             results.append((image_pil, caption))
 
         except Exception as e:
-            print(f"❌ Error processing image: {e}")
+            print(f"❌ Error during captioning: {e}")
             results.append((image_pil, "❌ Failed to generate caption."))
 
     print(f"\n✅ Completed captioning {len(results)} images.")
     return results, results
 
 
-def save_results(results_to_save):
+def save_results(results_to_save, trigger_word=""):
     if not results_to_save:
         return "⚠️ No results to save."
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    trigger_word = trigger_word.strip()
     num_saved = 0
 
     for i, (image, caption) in enumerate(results_to_save):
@@ -120,13 +114,17 @@ def save_results(results_to_save):
             txt_path = os.path.join(OUTPUT_FOLDER, f"img_{i+1:04d}.txt")
 
             image.save(img_path, "PNG")
+
+            final_caption = f"{trigger_word} {caption}".strip(
+            ) if trigger_word else caption
             with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(caption)
+                f.write(final_caption)
+
             num_saved += 1
         except Exception as e:
             print(f"❌ Error saving image {i+1}: {e}")
 
-    return f"✅ Saved {num_saved} image-caption pairs in '{OUTPUT_FOLDER}'"
+    return f"✅ Saved {num_saved} image-caption pairs to '{OUTPUT_FOLDER}' folder."
 
 
 def zip_and_return_path():
@@ -139,20 +137,25 @@ def zip_and_return_path():
         return None
 
 
-# ========== STEP 3: GRADIO UI ========== #
+# ========== GRADIO UI ========== #
 if __name__ == "__main__":
-
     with gr.Blocks(theme=gr.themes.Soft()) as gui:
         gr.Markdown("# Florence-2 Batch Image Captioning")
         gr.Markdown(
-            "Upload images → Enter a prompt (or use default) → Generate captions → Save → Download ZIP")
+            "Upload images → Set prompt/trigger → Generate → Save → Download")
 
         results_state = gr.State([])
 
         prompt_input = gr.Textbox(
             label="Caption Prompt",
             value="<MORE_DETAILED_CAPTION>",
-            placeholder="Enter prompt like <MORE_DETAILED_CAPTION>, <CUTE_CAT>, etc.",
+            placeholder="e.g., <MORE_DETAILED_CAPTION>, <FASHION>, <CUTE_CAT>",
+            interactive=True
+        )
+
+        trigger_input = gr.Textbox(
+            label="Trigger Word (Optional)",
+            placeholder="e.g. This_person01",
             interactive=True
         )
 
@@ -176,7 +179,7 @@ if __name__ == "__main__":
             zip_btn = gr.Button("📦 Download ZIP", variant="secondary")
 
         status_text = gr.Textbox(label="Status", interactive=False)
-        zip_file = gr.File(label="Download Link", interactive=False)
+        zip_file = gr.File(label="Download ZIP", interactive=False)
 
         # Button Logic
         generate_btn.click(
@@ -187,7 +190,7 @@ if __name__ == "__main__":
 
         save_btn.click(
             fn=save_results,
-            inputs=results_state,
+            inputs=[results_state, trigger_input],
             outputs=status_text
         )
 
@@ -196,5 +199,5 @@ if __name__ == "__main__":
             outputs=zip_file
         )
 
-    print("🚀 Launching GUI...")
+    print("🚀 Launching Florence-2 Gradio App...")
     gui.launch(share=True)
